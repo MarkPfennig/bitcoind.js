@@ -24,6 +24,12 @@
 #include <leveldb/comparator.h>
 
 /**
+ * secp256k1
+ */
+
+#include <secp256k1.h>
+
+/**
  * Bitcoin headers
  */
 
@@ -45,7 +51,8 @@
 #include "coincontrol.h"
 #include "coins.h"
 #include "compat.h"
-#include "core.h"
+#include "core/block.h"
+#include "core/transaction.h"
 #include "core_io.h"
 #include "crypter.h"
 #include "db.h"
@@ -68,12 +75,12 @@
 #include "rpcprotocol.h"
 #include "rpcserver.h"
 #include "rpcwallet.h"
-#include "script/compressor.h"
 #include "script/interpreter.h"
 #include "script/script.h"
 #include "script/sigcache.h"
 #include "script/sign.h"
 #include "script/standard.h"
+#include "script/script_error.h"
 #include "serialize.h"
 #include "sync.h"
 #include "threadsafety.h"
@@ -104,8 +111,10 @@
 #include "json/json_spirit_writer_template.h"
 
 #include "crypto/common.h"
-#include "crypto/sha2.h"
+#include "crypto/hmac_sha512.h"
 #include "crypto/sha1.h"
+#include "crypto/sha256.h"
+#include "crypto/sha512.h"
 #include "crypto/ripemd160.h"
 
 #include "univalue/univalue_escapes.h"
@@ -150,64 +159,10 @@ extern CFeeRate payTxFee;
 extern const std::string strMessageMagic;
 // extern map<uint256, COrphanBlock*> mapOrphanBlocks;
 
-// XXX May not link properly: some functions here are static (rpcdump.cpp):
-// extern std::string EncodeDumpTime(int64_t nTime);
-// extern int64_t DecodeDumpTime(const std::string &str);
-// extern std::string EncodeDumpString(const std::string &str);
-// extern std::string DecodeDumpString(const std::string &str);
-
-static std::string
-EncodeDumpTime(int64_t nTime) {
-  return DateTimeStrFormat("%Y-%m-%dT%H:%M:%SZ", nTime);
-}
-
-static int64_t
-DecodeDumpTime(const std::string &str) {
-  static const boost::posix_time::ptime epoch = boost::posix_time::from_time_t(0);
-  static const std::locale loc(std::locale::classic(),
-    new boost::posix_time::time_input_facet("%Y-%m-%dT%H:%M:%SZ"));
-  std::istringstream iss(str);
-  iss.imbue(loc);
-  boost::posix_time::ptime ptime(boost::date_time::not_a_date_time);
-  iss >> ptime;
-  if (ptime.is_not_a_date_time()) {
-    return 0;
-  }
-  return (ptime - epoch).total_seconds();
-}
-
-static std::string
-EncodeDumpString(const std::string &str) {
-  std::stringstream ret;
-  BOOST_FOREACH(unsigned char c, str) {
-    if (c <= 32 || c >= 128 || c == '%') {
-      ret << '%' << HexStr(&c, &c + 1);
-    } else {
-      ret << c;
-    }
-  }
-  return ret.str();
-}
-
-// May not need this - not static:
-#if 0
-static std::string
-DecodeDumpString(const std::string &str) {
-  std::stringstream ret;
-  for (unsigned int pos = 0; pos < str.length(); pos++) {
-      unsigned char c = str[pos];
-    if (c == '%' && pos+2 < str.length()) {
-      c = (((str[pos+1]>>6)*9+((str[pos+1]-'0')&15)) << 4) |
-          ((str[pos+2]>>6)*9+((str[pos+2]-'0')&15));
-      pos += 2;
-    }
-    ret << c;
-  }
-  return ret.str();
-}
-#else
+extern std::string EncodeDumpTime(int64_t nTime);
+extern int64_t DecodeDumpTime(const std::string &str);
+extern std::string EncodeDumpString(const std::string &str);
 extern std::string DecodeDumpString(const std::string &str);
-#endif
 
 /**
  * Node.js System
@@ -233,8 +188,6 @@ using namespace v8;
 
 // LevelDB options
 #define USE_LDB_ADDR 0
-#define USE_LDB_FILES 1
-#define USE_LDB_BLOCK 1
 
 /**
  * Node.js Exposed Function Templates
@@ -259,6 +212,7 @@ NAN_METHOD(GetGenerate);
 NAN_METHOD(GetMiningInfo);
 NAN_METHOD(GetAddrTransactions);
 NAN_METHOD(GetBestBlock);
+NAN_METHOD(GetChainHeight);
 
 NAN_METHOD(GetBlockHex);
 NAN_METHOD(GetTxHex);
@@ -444,19 +398,12 @@ static volatile bool shutdown_complete = false;
 static char *g_data_dir = NULL;
 static bool g_rpc = false;
 static bool g_testnet = false;
+static bool g_txindex = false;
 
 /**
  * Private Structs
  * Used for async functions and necessary linked lists at points.
  */
-
-#if 0
-typedef struct _prev_list {
-  std::string addr;
-  int64_t val;
-  struct _prev_list *next;
-} prev_list;
-#endif
 
 /**
  * async_node_data
@@ -469,6 +416,7 @@ struct async_node_data {
   std::string datadir;
   bool rpc;
   bool testnet;
+  bool txindex;
   Persistent<Function> callback;
 };
 
@@ -482,9 +430,6 @@ struct async_block_data {
   int64_t height;
   CBlock cblock;
   CBlockIndex* cblock_index;
-#if 0
-  prev_list *inputs;
-#endif
   Persistent<Function> callback;
 };
 
@@ -497,9 +442,6 @@ struct async_tx_data {
   std::string txHash;
   std::string blockHash;
   CTransaction ctx;
-#if 0
-  prev_list *inputs;
-#endif
   Persistent<Function> callback;
 };
 
@@ -511,12 +453,14 @@ typedef struct _ctx_list {
   CTransaction ctx;
   uint256 blockhash;
   struct _ctx_list *next;
+  std::string err_msg;
 } ctx_list;
 
 struct async_addrtx_data {
   std::string err_msg;
   std::string addr;
   ctx_list *ctxs;
+  int64_t blockindex;
   Persistent<Function> callback;
 };
 
@@ -626,6 +570,7 @@ NAN_METHOD(StartBitcoind) {
   std::string datadir = std::string("");
   bool rpc = false;
   bool testnet = false;
+  bool txindex = false;
 
   if (args.Length() >= 2 && args[0]->IsObject() && args[1]->IsFunction()) {
     Local<Object> options = Local<Object>::Cast(args[0]);
@@ -638,6 +583,9 @@ NAN_METHOD(StartBitcoind) {
     }
     if (options->Get(NanNew<String>("testnet"))->IsBoolean()) {
       testnet = options->Get(NanNew<String>("testnet"))->ToBoolean()->IsTrue();
+    }
+    if (options->Get(NanNew<String>("txindex"))->IsBoolean()) {
+      txindex = options->Get(NanNew<String>("txindex"))->ToBoolean()->IsTrue();
     }
     callback = Local<Function>::Cast(args[1]);
   } else if (args.Length() >= 2
@@ -659,8 +607,9 @@ NAN_METHOD(StartBitcoind) {
   data->err_msg = std::string("");
   data->result = std::string("");
   data->datadir = datadir;
-  data->testnet = testnet;
   data->rpc = rpc;
+  data->testnet = testnet;
+  data->txindex = txindex;
   data->callback = Persistent<Function>::New(callback);
 
   uv_work_t *req = new uv_work_t();
@@ -691,6 +640,7 @@ async_start_node(uv_work_t *req) {
   }
   g_rpc = (bool)data->rpc;
   g_testnet = (bool)data->testnet;
+  g_txindex = (bool)data->txindex;
   start_node();
   data->result = std::string("start_node(): bitcoind opened.");
 }
@@ -775,7 +725,7 @@ start_node_thread(void) {
 
   // Workaround for AppInit2() arg parsing. Not ideal, but it works.
   int argc = 0;
-  char **argv = (char **)malloc((3 + 1) * sizeof(char **));
+  char **argv = (char **)malloc((4 + 1) * sizeof(char **));
 
   argv[argc] = (char *)"bitcoind";
   argc++;
@@ -800,6 +750,11 @@ start_node_thread(void) {
 
   if (g_testnet) {
     argv[argc] = (char *)"-testnet";
+    argc++;
+  }
+
+  if (g_txindex) {
+    argv[argc] = (char *)"-txindex";
     argc++;
   }
 
@@ -1050,30 +1005,6 @@ async_get_block(uv_work_t *req) {
   if (ReadBlockFromDisk(cblock, pblockindex)) {
     data->cblock = cblock;
     data->cblock_index = pblockindex;
-#if 0
-    BOOST_FOREACH(const CTransaction& ctx, cblock.vtx) {
-      BOOST_FOREACH(const CTxIn& txin, ctx.vin) {
-        CTransaction prev_tx;
-        if (GetTransaction(txin.prevout.hash, prev_tx, block_hash, true)) {
-          CTxDestination from;
-          CTxOut prev_out = prev_tx.vout[txin.prevout.n];
-          ExtractDestination(prev_out.scriptPubKey, from);
-          CBitcoinAddress addrFrom(from);
-          std::string addr = addrFrom.ToString();
-          int64_t val = (int64_t)prev_out.nValue;
-          prev_list *cur = new prev_list();
-          cur->addr = addr;
-          cur->val = val;
-          if (data->inputs == NULL) {
-            data->inputs = cur;
-          } else {
-            data->inputs->next = cur;
-            data->inputs = cur;
-          }
-        }
-      }
-    }
-#endif
   } else {
     data->err_msg = std::string("get_block(): failed.");
   }
@@ -1099,24 +1030,6 @@ async_get_block_after(uv_work_t *req) {
 
     Local<Object> jsblock = NanNew<Object>();
     cblock_to_jsblock(cblock, cblock_index, jsblock, false);
-
-#if 0
-    prev_list *head = data->inputs;
-    prev_list *cur = data->inputs;
-    prev_list *next;
-    for (int i = 0; i < jsblock->tx->ength(); i++) {
-      for (int j = 0; j < jstx->vin->Length(); j++) {
-        next = cur->next;
-        jsblock.
-        Local<Object> jsprev = NanNew<Object>();
-        jsprev->Set(NanNew<String>("address"), NanNew<String>(cur->addr));
-        jsprev->Set(NanNew<String>("value"), NanNew<Number>(cur->val));
-        jsblock->tx->Get(i)->vin->Get(j)->Set(NanNew<String>("prev"), jsprev);
-        delete cur;
-        cur = next;
-      }
-    }
-#endif
 
     const unsigned argc = 2;
     Local<Value> argv[argc] = {
@@ -1215,28 +1128,6 @@ async_get_tx(uv_work_t *req) {
 collect_prev:
   return;
 
-#if 0
-  BOOST_FOREACH(const CTxIn& txin, ctx.vin) {
-    CTransaction prev_tx;
-    if (GetTransaction(txin.prevout.hash, prev_tx, block_hash, true)) {
-      CTxDestination from;
-      CTxOut prev_out = prev_tx.vout[txin.prevout.n];
-      ExtractDestination(prev_out.scriptPubKey, from);
-      CBitcoinAddress addrFrom(from);
-      std::string addr = addrFrom.ToString();
-      int64_t val = (int64_t)prev_out.nValue;
-      prev_list *cur = new prev_list();
-      cur->addr = addr;
-      cur->val = val;
-      if (data->inputs == NULL) {
-        data->inputs = cur;
-      } else {
-        data->inputs->next = cur;
-        data->inputs = cur;
-      }
-    }
-  }
-#endif
 }
 
 static void
@@ -1263,22 +1154,6 @@ async_get_tx_after(uv_work_t *req) {
   } else {
     Local<Object> jstx = NanNew<Object>();
     ctx_to_jstx(ctx, block_hash, jstx);
-
-    // XXX Do this for GetBlock, and PacketHook
-#if 0
-    prev_list *head = data->inputs;
-    prev_list *cur = data->inputs;
-    prev_list *next;
-    for (int i = 0; i < jstx->vin->Length(); i++) {
-      next = cur->next;
-      Local<Object> jsprev = NanNew<Object>();
-      jsprev->Set(NanNew<String>("address"), NanNew<String>(cur->addr));
-      jsprev->Set(NanNew<String>("value"), NanNew<Number>(cur->val));
-      jstx->vin->Get(i)->Set(NanNew<String>("prev"), jsprev);
-      delete cur;
-      cur = next;
-    }
-#endif
 
     const unsigned argc = 2;
     Local<Value> argv[argc] = {
@@ -1608,7 +1483,7 @@ NAN_METHOD(GetInfo) {
   obj->Set(NanNew<String>("connections"), NanNew<Number>((int)vNodes.size())->ToInt32());
   obj->Set(NanNew<String>("proxy"), NanNew<String>(proxy.IsValid() ? proxy.ToStringIPPort() : std::string("")));
   obj->Set(NanNew<String>("difficulty"), NanNew<Number>((double)GetDifficulty()));
-  obj->Set(NanNew<String>("testnet"), NanNew<Boolean>(Params().NetworkID() == CBaseChainParams::TESTNET));
+  obj->Set(NanNew<String>("testnet"), NanNew<Boolean>(Params().NetworkIDString() == "test"));
 #ifdef ENABLE_WALLET
   if (pwalletMain) {
     obj->Set(NanNew<String>("keypoololdest"), NanNew<Number>(pwalletMain->GetOldestKeyPoolTime()));
@@ -1679,8 +1554,17 @@ NAN_METHOD(GetPeerInfo) {
     if (fStateStats) {
       obj->Set(NanNew<String>("banscore"), NanNew<Number>(statestats.nMisbehavior));
       obj->Set(NanNew<String>("syncheight"), NanNew<Number>(statestats.nSyncHeight)->ToInt32());
+      obj->Set(NanNew<String>("synced_headers"), NanNew<Number>(statestats.nSyncHeight)->ToInt32());
+      obj->Set(NanNew<String>("synced_blocks"), NanNew<Number>(statestats.nCommonHeight)->ToInt32());
+      Local<Array> heights = NanNew<Array>();
+      int hi = 0;
+      BOOST_FOREACH(int height, statestats.vHeightInFlight) {
+        heights->Set(hi, NanNew<Number>(height));
+        hi++;
+      }
+      obj->Set(NanNew<String>("inflight"), heights);
     }
-    obj->Set(NanNew<String>("syncnode"), NanNew<Boolean>(stats.fSyncNode));
+
     obj->Set(NanNew<String>("whitelisted"), NanNew<Boolean>(stats.fWhitelisted));
     // obj->Set(NanNew<String>("relaytxes"), NanNew<Boolean>(stats.fRelayTxes));
 
@@ -1938,23 +1822,6 @@ NAN_METHOD(GetMiningInfo) {
 
   json_spirit::Array empty_params;
 
-  // (json_spirit::Value)GetNetworkHashPS(120 /* blocks=-1 */, -1 /* height=x */);
-  // (int64_t)GetNetworkHashPS(120 /* blocks=-1 */, -1 /* height=x */).get_int64();
-  // (int64_t)getnetworkhashps(empty_params, false).get_int64();
-
-  // (json_spirit::Value)getgenerate(empty_params, false);
-  // (bool)getgenerate(empty_params, false).get_bool();
-  // (bool)GetBoolArg("-gen", false);
-
-  // (json_spirit::Value)gethashespersec(empty_params, false);
-  // (int64_t)gethashespersec(empty_params, false).get_int64();
-  // int64_t hashespersec = 0;
-  // if (GetTimeMillis() - nHPSTimerStart > 8000) {
-  //   hashespersec = (int64_t)0;
-  // } else {
-  //   hashespersec = (int64_t)dHashesPerSec;
-  // }
-
   obj->Set(NanNew<String>("blocks"), NanNew<Number>((int)chainActive.Height()));
   obj->Set(NanNew<String>("currentblocksize"), NanNew<Number>((uint64_t)nLastBlockSize));
   obj->Set(NanNew<String>("currentblocktx"), NanNew<Number>((uint64_t)nLastBlockTx));
@@ -1968,7 +1835,7 @@ NAN_METHOD(GetMiningInfo) {
   obj->Set(NanNew<String>("networkhashps"), NanNew<Number>(
     (int64_t)getnetworkhashps(empty_params, false).get_int64()));
   obj->Set(NanNew<String>("pooledtx"), NanNew<Number>((uint64_t)mempool.size()));
-  obj->Set(NanNew<String>("testnet"), NanNew<Boolean>(Params().NetworkID() == CBaseChainParams::TESTNET));
+  obj->Set(NanNew<String>("testnet"), NanNew<Boolean>(Params().NetworkIDString() == "test"));
   obj->Set(NanNew<String>("chain"), NanNew<String>(Params().NetworkIDString()));
 #ifdef ENABLE_WALLET
   obj->Set(NanNew<String>("generate"), NanNew<Boolean>(
@@ -1990,24 +1857,46 @@ NAN_METHOD(GetAddrTransactions) {
   NanScope();
 
   if (args.Length() < 2
-      || !args[0]->IsString()
+      || (!args[0]->IsString() && !args[0]->IsObject())
       || !args[1]->IsFunction()) {
     return NanThrowError(
       "Usage: bitcoindjs.getAddrTransactions(addr, callback)");
   }
 
-  String::Utf8Value addr_(args[0]->ToString());
+  std::string addr = "";
+  int64_t blockindex = -1;
+
+  if (args[0]->IsString()) {
+    String::Utf8Value addr_(args[0]->ToString());
+    addr = std::string(*addr_);
+  } else if (args[0]->IsObject()) {
+    Local<Object> options = Local<Object>::Cast(args[0]);
+    if (options->Get(NanNew<String>("address"))->IsString()) {
+      String::Utf8Value s_(options->Get(NanNew<String>("address"))->ToString());
+      addr = std::string(*s_);
+    }
+    if (options->Get(NanNew<String>("addr"))->IsString()) {
+      String::Utf8Value s_(options->Get(NanNew<String>("addr"))->ToString());
+      addr = std::string(*s_);
+    }
+    if (options->Get(NanNew<String>("index"))->IsNumber()) {
+      blockindex = options->Get(NanNew<String>("index"))->IntegerValue();
+    }
+    if (options->Get(NanNew<String>("blockindex"))->IsNumber()) {
+      blockindex = options->Get(NanNew<String>("blockindex"))->IntegerValue();
+    }
+  }
+
   Local<Function> callback = Local<Function>::Cast(args[1]);
 
   Persistent<Function> cb;
   cb = Persistent<Function>::New(callback);
 
-  std::string addr = std::string(*addr_);
-
   async_addrtx_data *data = new async_addrtx_data();
   data->err_msg = std::string("");
   data->addr = addr;
   data->ctxs = NULL;
+  data->blockindex = blockindex;
   data->callback = Persistent<Function>::New(callback);
 
   uv_work_t *req = new uv_work_t();
@@ -2026,6 +1915,11 @@ static void
 async_get_addrtx(uv_work_t *req) {
   async_addrtx_data* data = static_cast<async_addrtx_data*>(req->data);
 
+  if (data->addr.empty()) {
+    data->err_msg = std::string("Invalid address.");
+    return;
+  }
+
   CBitcoinAddress address = CBitcoinAddress(data->addr);
   if (!address.IsValid()) {
     data->err_msg = std::string("Invalid address.");
@@ -2035,10 +1929,12 @@ async_get_addrtx(uv_work_t *req) {
 #if !USE_LDB_ADDR
   CScript expected = GetScriptForDestination(address.Get());
 
-  // int64_t i = 0;
-  // Check the last 20,000 blocks
-  int64_t i = chainActive.Height() - 20000;
-  if (i < 0) i = 0;
+  int64_t i = 0;
+
+  if (data->blockindex != -1) {
+    i = data->blockindex;
+  }
+
   int64_t height = chainActive.Height();
 
   for (; i <= height; i++) {
@@ -2099,6 +1995,10 @@ done:
   return;
 #else
   ctx_list *ctxs = read_addr(data->addr);
+  if (!ctxs->err_msg.empty()) {
+    data->err_msg = ctxs->err_msg;
+    return;
+  }
   data->ctxs = ctxs;
   if (data->ctxs == NULL) {
     data->err_msg = std::string("Could not read database.");
@@ -2170,6 +2070,23 @@ NAN_METHOD(GetBestBlock) {
   uint256 hash = pcoinsTip->GetBestBlock();
 
   NanReturnValue(NanNew<String>(hash.GetHex()));
+}
+
+/**
+ * GetChainHeight()
+ * bitcoindjs.getChainHeight()
+ * Get miscellaneous information
+ */
+
+NAN_METHOD(GetChainHeight) {
+  NanScope();
+
+  if (args.Length() > 0) {
+    return NanThrowError(
+      "Usage: bitcoindjs.getChainHeight()");
+  }
+
+  NanReturnValue(NanNew<Number>((int)chainActive.Height())->ToInt32());
 }
 
 /**
@@ -2567,8 +2484,6 @@ NAN_METHOD(HookPackets) {
       vRecv >> block;
       Local<Object> jsblock = NanNew<Object>();
       cblock_to_jsblock(block, NULL, jsblock, true);
-      // cblock_to_jsblock(block, NULL, o, true);
-      // last_block_hash = block.GetHash();
       o->Set(NanNew<String>("block"), jsblock);
     } else if (strCommand == "getaddr") {
       ; // not much other information in getaddr as long as we know we got a getaddr
@@ -3792,10 +3707,30 @@ NAN_METHOD(WalletCreateMultiSigAddress) {
     NanReturnValue(Undefined());
   }
 
-  CScript inner = _createmultisig_redeemScript(nRequired, keys);
+  std::string strAccount = "";
+
+  if (options->Get(NanNew<String>("account"))->IsString()) {
+    String::Utf8Value account_(options->Get(NanNew<String>("account"))->ToString());
+    strAccount = std::string(*account_);
+  }
+
+  if (options->Get(NanNew<String>("label"))->IsString()) {
+    String::Utf8Value account_(options->Get(NanNew<String>("label"))->ToString());
+    strAccount = std::string(*account_);
+  }
+
+  if (options->Get(NanNew<String>("name"))->IsString()) {
+    String::Utf8Value account_(options->Get(NanNew<String>("name"))->ToString());
+    strAccount = std::string(*account_);
+  }
 
   // Construct using pay-to-script-hash:
-  CScriptID innerID = inner.GetID();
+  CScript inner = _createmultisig_redeemScript(nRequired, keys);
+
+  CScriptID innerID(inner);
+  pwalletMain->AddCScript(inner);
+  pwalletMain->SetAddressBook(innerID, strAccount, "send");
+
   CBitcoinAddress address(innerID);
 
   Local<Object> result = NanNew<Object>();
@@ -5825,24 +5760,20 @@ jstx_to_ctx(const Local<Object> jstx, CTransaction& ctx_) {
 
     Local<Object> in = Local<Object>::Cast(vin->Get(vi));
 
-    //if (ctx.IsCoinBase()) {
-    //  txin.prevout.hash = uint256(0);
-    //  txin.prevout.n = (unsigned int)0;
-    //} else {
-      String::AsciiValue phash__(in->Get(NanNew<String>("txid"))->ToString());
-      std::string phash_ = *phash__;
-      uint256 phash(phash_);
+    String::AsciiValue phash__(in->Get(NanNew<String>("txid"))->ToString());
+    std::string phash_ = *phash__;
+    uint256 phash(phash_);
 
-      txin.prevout.hash = phash;
-      txin.prevout.n = (unsigned int)in->Get(NanNew<String>("vout"))->Uint32Value();
-    //}
+    txin.prevout.hash = phash;
+    txin.prevout.n = (unsigned int)in->Get(NanNew<String>("vout"))->Uint32Value();
 
     std::string shash_;
     Local<Object> script_obj = Local<Object>::Cast(in->Get(NanNew<String>("scriptSig")));
     String::AsciiValue shash__(script_obj->Get(NanNew<String>("hex"))->ToString());
     shash_ = *shash__;
-    uint256 shash(shash_);
-    CScript scriptSig(shash);
+
+    std::vector<unsigned char> shash(shash_.begin(), shash_.end());
+    CScript scriptSig(shash.begin(), shash.end());
 
     txin.scriptSig = scriptSig;
     txin.nSequence = (unsigned int)in->Get(NanNew<String>("sequence"))->Uint32Value();
@@ -5862,8 +5793,9 @@ jstx_to_ctx(const Local<Object> jstx, CTransaction& ctx_) {
     Local<Object> script_obj = Local<Object>::Cast(out->Get(NanNew<String>("scriptPubKey")));
     String::AsciiValue phash__(script_obj->Get(NanNew<String>("hex")));
     std::string phash_ = *phash__;
-    uint256 phash(phash_);
-    CScript scriptPubKey(phash);
+
+    std::vector<unsigned char> phash(phash_.begin(), phash_.end());
+    CScript scriptPubKey(phash.begin(), phash.end());
 
     txout.scriptPubKey = scriptPubKey;
 
@@ -5874,509 +5806,102 @@ jstx_to_ctx(const Local<Object> jstx, CTransaction& ctx_) {
 }
 
 #if USE_LDB_ADDR
-static leveldb::Options
-GetOptions(size_t nCacheSize) {
-  leveldb::Options options;
-  options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);
-  options.write_buffer_size = nCacheSize / 4; // up to two write buffers may be held in memory simultaneously
-  options.filter_policy = leveldb::NewBloomFilterPolicy(10);
-  options.compression = leveldb::kNoCompression;
-  options.max_open_files = 64;
-  if (leveldb::kMajorVersion > 1 || (leveldb::kMajorVersion == 1 && leveldb::kMinorVersion >= 16)) {
-    // LevelDB versions before 1.16 consider short writes to be corruption. Only trigger error
-    // on corruption in later versions.
-    options.paranoid_checks = true;
-  }
-  return options;
-}
-
-// http://leveldb.googlecode.com/svn/tags/1.17/doc/index.html
-
-#if 0
-class TwoPartComparator : public leveldb::Comparator {
-  public:
-    int Compare(const leveldb::Slice& key, const leveldb::Slice& end) const {
-      std::string key_ = key.ToString();
-      const char *k = key_.c_str();
-#if USE_LDB_BLOCK
-      if (k[0] == 'b') return -1;
-#else
-      if (k[0] == 't') return -1;
-#endif
-      return 1;
-    }
-    const char* Name() const { return "TwoPartComparator"; }
-    void FindShortestSeparator(std::string*, const leveldb::Slice&) const { }
-    void FindShortSuccessor(std::string*) const { }
-};
-#endif
-
 static ctx_list *
 read_addr(const std::string addr) {
   ctx_list *head = new ctx_list();
   ctx_list *cur = NULL;
 
-#if 0
-  // XXX TEST
-  const CBlock& cblock = Params().GenesisBlock();
-  CTransaction ctx = cblock.vtx[0];
-  if (cur == NULL) {
-    head->ctx = ctx;
-    //uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-    //head->blockhash = hash;
-    head->blockhash = cblock.GetHash();
-    head->next = NULL;
-    cur = head;
-  } else {
-    ctx_list *item = new ctx_list();
-    item->ctx = ctx;
-    //uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-    //item->blockhash = hash;
-    item->blockhash = cblock.GetHash();
-    item->next = NULL;
-    cur->next = item;
-    cur = item;
-  }
-  return head;
-#endif
-
-
-  // custom environment this database is using (may be NULL in case of default environment)
-  leveldb::Env* penv;
-
-  // database options used
-  leveldb::Options options;
-
-  // options used when reading from the database
-  leveldb::ReadOptions readoptions;
-
-  // options used when iterating over values of the database
-  leveldb::ReadOptions iteroptions;
-
-  // options used when writing to the database
-  leveldb::WriteOptions writeoptions;
-
-  // options used when sync writing to the database
-  leveldb::WriteOptions syncoptions;
-
-  // the database itself
-  leveldb::DB* pdb;
-
-  size_t nCacheSize = 0x100000;
-  bool fMemory = false;
-  bool fWipe = false;
-
-  // Options:
-  // https://code.google.com/p/leveldb/source/browse/include/leveldb/options.h
-
-  penv = NULL;
-  readoptions.verify_checksums = true;
-  iteroptions.verify_checksums = true;
-  iteroptions.fill_cache = false;
-  syncoptions.sync = true;
-  options = GetOptions(nCacheSize);
-  //options.create_if_missing = true;
-  options.create_if_missing = false;
-
-#if 0
-  TwoPartComparator cmp;
-  options.comparator = &cmp;
-#endif
-
-
-
-
-
-#if 0
-  int64_t nMaxDbCache = sizeof(void*) > 4 ? 4096 : 1024;
-  size_t nTotalCache = (100 << 20);
-  if (nTotalCache < (4 << 20)) {
-    nTotalCache = (4 << 20);
-  } else if (nTotalCache > (nMaxDbCache << 20)) {
-    nTotalCache = (nMaxDbCache << 20);
-  }
-  size_t nBlockTreeDBCache = nTotalCache / 8;
-  if (nBlockTreeDBCache > (1 << 21)) {
-    nBlockTreeDBCache = (1 << 21);
-  }
-  UnloadBlockIndex();
-  pblocktree->Flush();
-  delete pblocktree;
-  // after:
-  pblocktree = new CBlockTreeDB(nBlockTreeDBCache, false, fReindex);
-#endif
-
-  do {
-    // ~/bitcoin/src/txdb.cpp
-    // pblocktree = 'CBlockTreeDB'
-    // ~/bitcoin/src/init.cpp
-    // ~/bitcoin/src/main.cpp
-
-    // const boost::filesystem::path path = GetDataDir() / "chainstate";
-    // CLevelDBWrapper db(path, nCacheSize, fMemory, fWipe);
-    // leveldb::Iterator *pcursor = const_cast<CLevelDBWrapper*>(&db)->NewIterator();
-
-    const boost::filesystem::path path = GetDataDir() / "chainstate";
-    leveldb::Status status = leveldb::DB::Open(options, path.string(), &pdb);
-    if (!status.ok()) break;
-    leveldb::Iterator* pcursor = pdb->NewIterator(iteroptions);
-
-    pcursor->SeekToFirst();
-
-    while (pcursor->Valid()) {
-      boost::this_thread::interruption_point();
-      try {
-        leveldb::Slice slKey = pcursor->key();
-        CDataStream ssKey(slKey.data(), slKey.data() + slKey.size(), SER_DISK, CLIENT_VERSION);
-        char chType;
-        ssKey >> chType;
-        if (chType == 'c') {
-          leveldb::Slice slValue = pcursor->value();
-          CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
-          CCoins coins;
-          ssValue >> coins;
-          uint256 txhash;
-          ssKey >> txhash;
-
-#if 0
-          // XXX TEST
-          const CBlock& cblock = Params().GenesisBlock();
-          CTransaction ctx = cblock.vtx[0];
-          if (cur == NULL) {
-            head->ctx = ctx;
-            //uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-            //head->blockhash = hash;
-            head->blockhash = cblock.GetHash();
-            head->next = NULL;
-            cur = head;
-          } else {
-            ctx_list *item = new ctx_list();
-            item->ctx = ctx;
-            //uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-            //item->blockhash = hash;
-            item->blockhash = cblock.GetHash();
-            item->next = NULL;
-            cur->next = item;
-            cur = item;
-          }
-          goto done;
-#endif
-
-#if 0
-          // XXX TEST
-          CTransaction ctx;
-          CBlock cblock;
-          uint256 blockhash = 0;
-          if (GetTransaction(txhash, ctx, blockhash, true)) {
-            if (cur == NULL) {
-              head->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              head->blockhash = hash;
-              head->next = NULL;
-              cur = head;
-            } else {
-              ctx_list *item = new ctx_list();
-              item->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              item->blockhash = hash;
-              item->next = NULL;
-              cur->next = item;
-              cur = item;
-            }
-          }
-          goto done;
-#endif
-
-          for (unsigned int i = 0; i < coins.vout.size(); i++) {
-            const CTxOut &out = coins.vout[i];
-            if (out.IsNull()) {
-              continue;
-            }
-            const CScript& scriptPubKey = out.scriptPubKey;
-            int nRequired;
-            txnouttype type;
-            vector<CTxDestination> addresses;
-            if (!ExtractDestinations(scriptPubKey, type, addresses, nRequired)) {
-              continue;
-            }
-            CTransaction ctx;
-            CBlock cblock;
-            BOOST_FOREACH(const CTxDestination& address, addresses) {
-              if (CBitcoinAddress(address).ToString() != addr) {
-                continue;
-              }
-              uint256 blockhash = 0;
-              if (GetTransaction(txhash, ctx, blockhash, true)) {
-                goto found_tx;
-              } else {
-                int64_t i = 0;
-                int64_t height = chainActive.Height();
-                for (; i <= height; i++) {
-                  CBlockIndex* pblockindex = chainActive[i];
-                  if (ReadBlockFromDisk(cblock, pblockindex)) {
-                    BOOST_FOREACH(const CTransaction& tx, cblock.vtx) {
-                      if (tx.GetHash() == txhash) {
-                        ctx = tx;
-                        goto found_tx;
-                      }
-                    }
-                  }
-                }
-                continue;
-              }
-found_tx:
-              if (cur == NULL) {
-                head->ctx = ctx;
-                uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-                head->blockhash = hash;
-                head->next = NULL;
-                cur = head;
-              } else {
-                ctx_list *item = new ctx_list();
-                item->ctx = ctx;
-                uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-                item->blockhash = hash;
-                item->next = NULL;
-                cur->next = item;
-                cur = item;
-              }
-              goto found;
-            }
-          }
-        }
-found:
-        pcursor->Next();
-      } catch (std::exception &e) {
-        //return error("%s : Deserialize or I/O error - %s", __func__, e.what());
-        delete pcursor;
-        return head;
-      }
-    }
-
-//found:
-done:
-    // XXX Maybe put delete it before continue below too:
-    //assert(pcursor->status().ok());
-    delete pcursor;
-    continue;
-  } while (0);
-
-  return head;
-
-
-
-
-#if 0
+  head->err_msg = std::string("");
 
   CScript expectedScriptSig = GetScriptForDestination(CBitcoinAddress(addr).Get());
 
-#if USE_LDB_FILES
-  unsigned int nFile = 0;
-  unsigned int tryFiles = chainActive.Height();
-  for (; nFile <= tryFiles; nFile++) {
-    const boost::filesystem::path path = GetDataDir() / "blocks" / strprintf("%s%05u.dat", "blk", nFile);
-#else
-  do {
-    const boost::filesystem::path path = GetDataDir() / "blocks" / "index";
-#endif
+  leveldb::Iterator* pcursor = pblocktree->pdb->NewIterator(pblocktree->iteroptions);
 
-#if 1
-    if (fMemory) {
-      penv = leveldb::NewMemEnv(leveldb::Env::Default());
-      options.env = penv;
-    }
+  pcursor->SeekToFirst();
 
-    leveldb::Status status = leveldb::DB::Open(options, path.string(), &pdb);
+  while (pcursor->Valid()) {
+    boost::this_thread::interruption_point();
+    try {
+      leveldb::Slice slKey = pcursor->key();
 
-    if (!status.ok()) {
-      continue;
-      //break;
-    }
+      CDataStream ssKey(slKey.data(), slKey.data() + slKey.size(), SER_DISK, CLIENT_VERSION);
 
-    //leveldb::Iterator* it = pdb->NewIterator(leveldb::ReadOptions());
-    leveldb::Iterator* it = pdb->NewIterator(iteroptions);
-#else
-    // ~/bitcoin/src/txdb.cpp
-    CLevelDBWrapper db(path, nCacheSize, fMemory, fWipe);
-    leveldb::Iterator *it = const_cast<CLevelDBWrapper*>(&db)->NewIterator();
-#endif
+      char type;
+      ssKey >> type;
 
-    for (it->SeekToFirst(); it->Valid(); it->Next()) {
-      boost::this_thread::interruption_point();
-#if USE_LDB_BLOCK
-      // if (it->key().ToString().c_str()[0] != 'b') continue;
-      CBlock cblock;
-#else
-      // if (it->key().ToString().c_str()[0] != 't') continue;
-      CTransaction ctx;
-#endif
+      // Blockchain Index Structure:
+      // http://bitcoin.stackexchange.com/questions/28168
 
-      std::string strValue = it->value().ToString();
-
-      try {
-        CDataStream ssValue(strValue.data(), strValue.data() + strValue.size(), SER_DISK, CLIENT_VERSION);
-#if USE_LDB_BLOCK
-        ssValue >> cblock;
-#else
-        ssValue >> ctx;
-#endif
-      } catch (const std::exception&) {
-        // delete it;
-        // return NULL;
-        continue;
+      // File info record structure (Key: 4-byte file number)
+      //   Number of blocks stored in block file
+      //   Size of block file: blocks/blkXXXXX.dat
+      //   Size of undo file: blocks/revXXXXX.dat
+      //   Low and high heights of blocks stored in file
+      //   Low and high timestamps of blocks stored in file
+      if (type == 'f') {
+        goto found;
       }
 
-#if USE_LDB_BLOCK
-      BOOST_FOREACH(const CTransaction& ctx, cblock.vtx) {
-#endif
-        // vin
-        BOOST_FOREACH(const CTxIn& txin, ctx.vin) {
-          if (txin.scriptSig.ToString() != expectedScriptSig.ToString()) {
-            continue;
-          }
-          if (cur == NULL) {
-            head->ctx = ctx;
-            uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-            head->blockhash = hash;
-            head->next = NULL;
-            cur = head;
-          } else {
-            ctx_list *item = new ctx_list();
-            item->ctx = ctx;
-            uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-            item->blockhash = hash;
-            item->next = NULL;
-            cur->next = item;
-            cur = item;
-          }
+      // Last block file number used structure (Key: no key)
+      //   4-byte file number
+      if (type == 'l') {
+        goto found;
+      }
+
+      // Reindexing structure (Key: no key)
+      //   1-byte Boolean (1 if reindexing)
+      if (type == 'R') {
+        goto found;
+      }
+
+      // Flags structure (Key: 1-byte flag name + flag name string)
+      //   1-byte Boolean (key may be `txindex` if transaction index is enabled)
+      if (type == 'F') {
+        goto found;
+      }
+
+      // Block Structure:
+      //   CBlockHeader - headers
+      //   CDiskBlockPos - block file and pos
+      //   CDiskBlockPos - undo file and pos
+      if (type == 'b') {
+        leveldb::Slice slValue = pcursor->value();
+
+        CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
+
+        uint256 blockhash;
+        ssKey >> blockhash;
+
+        CBlockHeader header;
+        ssValue >> header;
+
+        // XXX This is not being parsed right. Check math/logic.
+        CDiskBlockPos blockPos;
+        ssValue >> blockPos;
+
+        // CDiskBlockPos undoPos;
+        // ssValue >> undoPos;
+
+        CBlock cblock;
+
+        if (!ReadBlockFromDisk(cblock, blockPos)) {
           goto found;
         }
 
-        // vout
-        for (unsigned int vo = 0; vo < ctx.vout.size(); vo++) {
-          const CTxOut& txout = ctx.vout[vo];
-          const CScript& scriptPubKey = txout.scriptPubKey;
-          int nRequired;
-          txnouttype type;
-          vector<CTxDestination> addresses;
-          if (!ExtractDestinations(scriptPubKey, type, addresses, nRequired)) {
-            continue;
-          }
-          BOOST_FOREACH(const CTxDestination& address, addresses) {
-            if (CBitcoinAddress(address).ToString() != addr) {
-              continue;
-            }
-            if (cur == NULL) {
-              head->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              head->blockhash = hash;
-              head->next = NULL;
-              cur = head;
-            } else {
-              ctx_list *item = new ctx_list();
-              item->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              item->blockhash = hash;
-              item->next = NULL;
-              cur->next = item;
-              cur = item;
-            }
-            goto found;
-          }
-        }
-#if USE_LDB_BLOCK
-      }
-#endif
-
-found:
-      continue;
-    }
-
-    assert(it->status().ok());
-
-    delete it;
-#if USE_LDB_FILES
-  }
-#else
-  } while (0);
-#endif
-
-#if 0
-
-#if USE_LDB_FILES
-  unsigned int nFile = 0;
-  unsigned int tryFiles = chainActive.Height();
-  for (; nFile <= tryFiles; nFile++) {
-    const boost::filesystem::path path = GetDataDir() / "blocks" / strprintf("%s%05u.dat", "blk", nFile);
-#else
-  do {
-    const boost::filesystem::path path = GetDataDir() / "blocks" / "index";
-#endif
-
-    if (fMemory) {
-      penv = leveldb::NewMemEnv(leveldb::Env::Default());
-      options.env = penv;
-    }
-
-    leveldb::Status status = leveldb::DB::Open(options, path.string(), &pdb);
-
-    if (!status.ok()) {
-      break;
-    }
-
-    leveldb::Slice start = "t";
-    leveldb::Slice end = "t\xFF";
-    //leveldb::Options options;
-
-    leveldb::Iterator* it = pdb->NewIterator(leveldb::ReadOptions());
-
-    for (it->Seek(start); it->Valid(); it->Next()) {
-      leveldb::Slice key = it->key();
-      leveldb::Slice value = it->value();
-
-      if (options.comparator->Compare(key, end) > 0) {
-        break;
-      } else {
-#if USE_LDB_BLOCK
-        CBlock cblock;
-#else
-        CTransaction ctx;
-#endif
-
-        std::string strValue = value.ToString();
-
-        try {
-          CDataStream ssValue(strValue.data(), strValue.data() + strValue.size(), SER_DISK, CLIENT_VERSION);
-#if USE_LDB_BLOCK
-          ssValue >> cblock;
-#else
-          ssValue >> ctx;
-#endif
-        } catch (const std::exception&) {
-          // delete it;
-          // return NULL;
-          continue;
-        }
-
-#if USE_LDB_BLOCK
         BOOST_FOREACH(const CTransaction& ctx, cblock.vtx) {
-#endif
-          // vin
           BOOST_FOREACH(const CTxIn& txin, ctx.vin) {
             if (txin.scriptSig.ToString() != expectedScriptSig.ToString()) {
               continue;
             }
             if (cur == NULL) {
               head->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              head->blockhash = hash;
+              head->blockhash = blockhash;
               head->next = NULL;
               cur = head;
             } else {
               ctx_list *item = new ctx_list();
               item->ctx = ctx;
-              uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-              item->blockhash = hash;
+              item->blockhash = blockhash;
               item->next = NULL;
               cur->next = item;
               cur = item;
@@ -6384,7 +5909,6 @@ found:
             goto found;
           }
 
-          // vout
           for (unsigned int vo = 0; vo < ctx.vout.size(); vo++) {
             const CTxOut& txout = ctx.vout[vo];
             const CScript& scriptPubKey = txout.scriptPubKey;
@@ -6400,15 +5924,13 @@ found:
               }
               if (cur == NULL) {
                 head->ctx = ctx;
-                uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-                head->blockhash = hash;
+                head->blockhash = blockhash;
                 head->next = NULL;
                 cur = head;
               } else {
                 ctx_list *item = new ctx_list();
                 item->ctx = ctx;
-                uint256 hash(((CMerkleTx)ctx).hashBlock.GetHex());
-                item->blockhash = hash;
+                item->blockhash = blockhash;
                 item->next = NULL;
                 cur->next = item;
                 cur = item;
@@ -6416,36 +5938,133 @@ found:
               goto found;
             }
           }
-#if USE_LDB_BLOCK
         }
-#endif
-
-found:
-        continue;
       }
+
+      // Transaction Structure:
+      //   CDiskBlockPos.nFile - block file
+      //   CDiskBlockPos.nPos - block pos
+      //   CDiskTxPos.nTxOffset - offset from top of block
+      if (type == 't') {
+        leveldb::Slice slValue = pcursor->value();
+
+        CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
+
+        uint256 txhash;
+        ssKey >> txhash;
+
+        CDiskBlockPos blockPos;
+        ssValue >> blockPos.nFile;
+        ssValue >> blockPos.nPos;
+
+        CDiskTxPos txPos;
+        // ssValue >> txPos.nFile;
+        // ssValue >> txPos.nPos;
+        txPos.nFile = blockPos.nFile;
+        txPos.nPos = blockPos.nPos;
+        ssValue >> txPos.nTxOffset;
+
+        CTransaction ctx;
+        uint256 blockhash;
+
+        if (!pblocktree->ReadTxIndex(txhash, txPos)) {
+          goto found;
+        }
+
+        CAutoFile file(OpenBlockFile(txPos, true), SER_DISK, CLIENT_VERSION);
+        CBlockHeader header;
+        try {
+          file >> header;
+          fseek(file.Get(), txPos.nTxOffset, SEEK_CUR);
+          file >> ctx;
+        } catch (std::exception &e) {
+          goto error;
+        }
+        if (ctx.GetHash() != txhash) {
+          goto error;
+        }
+        blockhash = header.GetHash();
+
+        BOOST_FOREACH(const CTxIn& txin, ctx.vin) {
+          if (txin.scriptSig.ToString() != expectedScriptSig.ToString()) {
+            continue;
+          }
+          if (cur == NULL) {
+            head->ctx = ctx;
+            head->blockhash = blockhash;
+            head->next = NULL;
+            cur = head;
+          } else {
+            ctx_list *item = new ctx_list();
+            item->ctx = ctx;
+            item->blockhash = blockhash;
+            item->next = NULL;
+            cur->next = item;
+            cur = item;
+          }
+          goto found;
+        }
+
+        for (unsigned int vo = 0; vo < ctx.vout.size(); vo++) {
+          const CTxOut& txout = ctx.vout[vo];
+          const CScript& scriptPubKey = txout.scriptPubKey;
+          int nRequired;
+          txnouttype type;
+          vector<CTxDestination> addresses;
+          if (!ExtractDestinations(scriptPubKey, type, addresses, nRequired)) {
+            continue;
+          }
+          BOOST_FOREACH(const CTxDestination& address, addresses) {
+            if (CBitcoinAddress(address).ToString() != addr) {
+              continue;
+            }
+            if (cur == NULL) {
+              head->ctx = ctx;
+              head->blockhash = blockhash;
+              head->next = NULL;
+              cur = head;
+            } else {
+              ctx_list *item = new ctx_list();
+              item->ctx = ctx;
+              item->blockhash = blockhash;
+              item->next = NULL;
+              cur->next = item;
+              cur = item;
+            }
+            goto found;
+          }
+        }
+      }
+found:
+      pcursor->Next();
+    } catch (std::exception &e) {
+      pcursor->Next();
+      continue;
+      leveldb::Slice lastKey = pcursor->key();
+      std::string lastKeyHex = HexStr(lastKey.ToString());
+      head->err_msg = std::string(e.what()
+        + std::string(" : Deserialize error. Key: ")
+        + lastKeyHex);
+      delete pcursor;
+      return head;
     }
-
-    delete it;
-#if USE_LDB_FILES
   }
-#else
-  } while (0);
-#endif
 
-#endif
+  delete pcursor;
 
   return head;
 
-#endif
+error:
+  head->err_msg = std::string("Deserialize Error.");
 
+  delete pcursor;
+
+  return head;
 }
 #endif
 
 static int64_t
 SatoshiFromAmount(const CAmount& amount) {
-  // ./core.h : static const int64_t COIN = 100000000;
-  // ValueFromAmount:
-  //   return (double)amount / (double)COIN;
   return (int64_t)amount;
 }
 
@@ -6480,6 +6099,7 @@ init(Handle<Object> target) {
   NODE_SET_METHOD(target, "getMiningInfo", GetMiningInfo);
   NODE_SET_METHOD(target, "getAddrTransactions", GetAddrTransactions);
   NODE_SET_METHOD(target, "getBestBlock", GetBestBlock);
+  NODE_SET_METHOD(target, "getChainHeight", GetChainHeight);
   NODE_SET_METHOD(target, "getBlockHex", GetBlockHex);
   NODE_SET_METHOD(target, "getTxHex", GetTxHex);
   NODE_SET_METHOD(target, "blockFromHex", BlockFromHex);
